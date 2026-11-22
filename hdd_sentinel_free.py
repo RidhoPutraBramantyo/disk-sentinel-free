@@ -152,6 +152,7 @@ class DiskInfo:
         self.smart_available = False
         self.used_bytes = 0
         self.free_bytes = 0
+        self.age_days = 0
 
     def to_dict(self):
         return {
@@ -164,6 +165,8 @@ class DiskInfo:
             "used_human": format_size(self.used_bytes),
             "free_bytes": self.free_bytes,
             "free_human": format_size(self.free_bytes),
+            "age_days": self.age_days,
+            "age_human": format_age(self.age_days),
             "interface": self.interface,
             "type": self.type,
             "status": self.status,
@@ -221,6 +224,26 @@ def format_temp(t):
     if t is None:
         return "N/A"
     return f"{t}\u00b0C"
+
+
+def format_age(days):
+    """Konversi hari menjadi representasi umur yang mudah dibaca (mirip HDD Sentinel)."""
+    if not days:
+        return "N/A"
+    years = int(days // 365)
+    remaining_days = int(days % 365)
+    months = int(remaining_days // 30)
+    days_left = int(remaining_days % 30)
+
+    parts = []
+    if years > 0:
+        parts.append(f"{years} tahun")
+    if months > 0:
+        parts.append(f"{months} bln")
+    if days_left > 0 or not parts:
+        parts.append(f"{days_left} hari")
+
+    return " ".join(parts)
 
 
 def format_health(h):
@@ -629,6 +652,10 @@ def enrich_disk(disk):
         disk.used_bytes = used
     if free is not None:
         disk.free_bytes = free
+
+    # Umur disk berdasarkan Power-On Hours (jam / 24 = hari)
+    if disk.power_on_hours > 0:
+        disk.age_days = int(disk.power_on_hours / 24)
     return disk
 
 
@@ -679,23 +706,24 @@ def cmd_list(args):
         enrich_disk(d)
 
     print(
-        f"\n{BOLD}{'DEVICE':<14}{'MODEL':<26}{'TYPE':<8}{'SIZE':<11}"
-        f"{'USED':<11}{'FREE':<11}{'TEMP':<7}{'HEALTH':<9} STATUS{RESET}"
+        f"\n{BOLD}{'DEVICE':<14}{'MODEL':<24}{'TYPE':<7}{'SIZE':<10}"
+        f"{'USED':<10}{'FREE':<10}{'TEMP':<7}{'HEALTH':<9}{'AGE':<10} STATUS{RESET}"
     )
-    print("-" * 110)
+    print("-" * 112)
     for d in disks:
         dev = d.device
-        model = (d.model[:24] + "..") if len(d.model) > 24 else d.model
+        model = (d.model[:22] + "..") if len(d.model) > 22 else d.model
         dtype = d.type or "N/A"
         size = format_size(d.size)
         used = format_size(d.used_bytes) if d.used_bytes else "N/A"
         free = format_size(d.free_bytes) if d.free_bytes else "N/A"
         temp = format_temp(d.temperature)
         health = format_health(d.health)
+        age = format_age(d.age_days)
         status = d.status
         print(
-            f"{dev:<14}{model:<26}{dtype:<8}{size:<11}"
-            f"{used:<11}{free:<11}{temp:<7}{health:<9} {status}"
+            f"{dev:<14}{model:<24}{dtype:<7}{size:<10}"
+            f"{used:<10}{free:<10}{temp:<7}  {health}  {age:<10}  {status}"
         )
     print()
     return 0
@@ -732,6 +760,7 @@ def cmd_info(args):
     print(f"SMART status     : {disk.smart_status}")
     print(f"Suhu             : {format_temp(disk.temperature)}")
     print(f"Jam menyala      : {disk.power_on_hours} jam")
+    print(f"Umur disk        : {format_age(disk.age_days)}")
     print(f"Kesehatan        : {format_health(disk.health)}")
     print()
 
@@ -803,19 +832,20 @@ def cmd_health(args):
         return 0
 
     print(f"\n{BOLD}RINGKASAN KESEHATAN DISK{RESET}")
-    print(f"{'DEVICE':<14}{'MODEL':<26}{'HEALTH':<9} TEMP   STATUS")
-    print("-" * 72)
+    print(f"{'DEVICE':<14}{'MODEL':<24}{'HEALTH':<9}{'TEMP':<7}{'AGE':<10} STATUS")
+    print("-" * 75)
     any_bad = False
     for d in disks:
         enrich_disk(d)
         dev = d.device
-        model = (d.model[:24] + "..") if len(d.model) > 24 else d.model
+        model = (d.model[:22] + "..") if len(d.model) > 22 else d.model
         health = d.health
         temp = format_temp(d.temperature)
+        age = format_age(d.age_days)
         status = d.status
         col = health_color(health)
         print(
-            f"{dev:<14}{model:<26}{c(f'{health}%', col):<9} {temp:<7}{status}"
+            f"{dev:<14}{model:<24}{c(f'{health}%', col):<9} {temp:<7}{age:<10} {status}"
         )
         if health < 70:
             any_bad = True

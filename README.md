@@ -24,6 +24,7 @@ Dibuat sebagai alternatif **gratis dan ringan** dari [HDD Sentinel](https://www.
 | 💾 Used / Free Space | Lihat ruang terpakai dan tersisa per disk |
 | ❤️ Health Score | Skor kesehatan 0–100 berdasarkan atribut SMART kritis |
 | 🌡️ Suhu & Jam Menyala | Monitoring suhu disk dan total jam disk menyala (Power-On Hours) |
+| 📅 Umur Disk | Estimasi umur disk berdasarkan Power-On Hours (tahun, bulan, hari) |
 | ⚠️ Bad Sector Deteksi | Deteksi reallocated sector, pending sector, offline uncorrectable |
 | 💿 SSD Wear | Estimasi usia SSD berdasarkan wear leveling |
 | 🖥️ Mode Interaktif | Menu interaktif untuk pengguna yang tidak hafal perintah CLI |
@@ -103,10 +104,10 @@ python hdd_sentinel_free.py list
 
 Contoh output:
 ```
-DEVICE        MODEL                     TYPE    SIZE       USED       FREE       TEMP   HEALTH   STATUS
---------------------------------------------------------------------------------------------------------------
-1             ADATA LEGEND 710          SSD     476.94 GB  317.39 GB  159.53 GB  N/A    80% OK
-0             Micron MTFDKCD512QGN...   SSD     476.94 GB  431.00 GB  45.67 GB   N/A    80% OK
+DEVICE        MODEL                   TYPE   SIZE      USED      FREE      TEMP   HEALTH   AGE        STATUS
+----------------------------------------------------------------------------------------------------------------
+1             ADATA LEGEND 710        SSD    476.94 GB 317.39 GB 159.53 GB N/A      80%  N/A         OK
+0             Micron MTFDKCD512QGN..  SSD    476.94 GB 431.00 GB 45.67 GB   N/A      80%  N/A         OK
 ```
 
 #### 2. Ringkasan kesehatan
