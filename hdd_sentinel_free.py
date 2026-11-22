@@ -3,7 +3,7 @@
 """
 HDD Sentinel Free - CLI Disk Health Monitor (Open Source / Gratis)
 Mirip HDD Sentinel: menampilkan kesehatan disk, suhu, SMART, jam menyala,
-bad sector, dan estimasi usia SSD.
+bad sector, umur disk, dan estimasi wear SSD/NVMe.
 
 Platform: Windows (utama), Linux, macOS
 Author: Open Source
@@ -15,6 +15,7 @@ import itertools
 import json
 import os
 import platform
+import re
 import subprocess
 import sys
 import threading
@@ -81,16 +82,13 @@ class Spinner:
         self.delay = delay
         self._running = False
         self._thread = None
-        # Karakter braille (halus) untuk terminal modern
         self._unicode_chars = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠶", "⠷", "⠾", "⠿"]
-        # Fallback aman untuk Windows CMD lama
         self._fallback_chars = ["-", "\\", "|", "/"]
 
     def _supports_unicode(self):
         try:
-            return sys.stdout.encoding and sys.stdout.encoding.lower().replace("-", "") in (
-                "utf8", "utf-8",
-            )
+            enc = (sys.stdout.encoding or "").lower().replace("-", "")
+            return enc in ("utf8", "utf-8")
         except Exception:
             return False
 
@@ -104,7 +102,6 @@ class Spinner:
             sys.stdout.write(line)
             sys.stdout.flush()
             time.sleep(self.delay)
-        # Bersihkan baris spinner setelah berhenti
         sys.stdout.write("\r" + " " * (len(self.message) + 6) + "\r")
         sys.stdout.flush()
 
@@ -147,12 +144,31 @@ class DiskInfo:
         self.temperature = None
         self.health = 100
         self.power_on_hours = 0
+        self.age_days = 0
         self.smart_attrs = {}
         self.smart_status = "Unknown"
         self.smart_available = False
+        self.is_nvme = False
         self.used_bytes = 0
         self.free_bytes = 0
-        self.age_days = 0
+        self.reliability = {}
+
+        # NVMe specific
+        self.nvme_critical_warning = None
+        self.nvme_available_spare = None
+        self.nvme_available_spare_thresh = None
+        self.nvme_percentage_used = None  # wear %
+        self.nvme_data_units_read = None
+        self.nvme_data_units_written = None
+        self.nvme_host_read_commands = None
+        self.nvme_host_write_commands = None
+        self.nvme_power_cycles = None
+        self.nvme_unsafe_shutdowns = None
+        self.nvme_media_errors = None
+
+        # ATA specific
+        self.ata_total_lbas_read = None
+        self.ata_total_lbas_written = None
 
     def to_dict(self):
         return {
@@ -165,24 +181,40 @@ class DiskInfo:
             "used_human": format_size(self.used_bytes),
             "free_bytes": self.free_bytes,
             "free_human": format_size(self.free_bytes),
-            "age_days": self.age_days,
-            "age_human": format_age(self.age_days),
             "interface": self.interface,
             "type": self.type,
             "status": self.status,
+            "is_nvme": self.is_nvme,
             "temperature_c": self.temperature,
             "health_percent": self.health,
             "power_on_hours": self.power_on_hours,
+            "age_days": self.age_days,
+            "age_human": format_age(self.age_days),
             "smart_status": self.smart_status,
             "smart_available": self.smart_available,
             "smart_attrs": self.smart_attrs,
+            # NVMe
+            "nvme_critical_warning": self.nvme_critical_warning,
+            "nvme_available_spare": self.nvme_available_spare,
+            "nvme_available_spare_thresh": self.nvme_available_spare_thresh,
+            "nvme_percentage_used": self.nvme_percentage_used,
+            "nvme_data_units_read": self.nvme_data_units_read,
+            "nvme_data_units_written": self.nvme_data_units_written,
+            "nvme_host_read_commands": self.nvme_host_read_commands,
+            "nvme_host_write_commands": self.nvme_host_write_commands,
+            "nvme_power_cycles": self.nvme_power_cycles,
+            "nvme_unsafe_shutdowns": self.nvme_unsafe_shutdowns,
+            "nvme_media_errors": self.nvme_media_errors,
+            # ATA
+            "ata_total_lbas_read": self.ata_total_lbas_read,
+            "ata_total_lbas_written": self.ata_total_lbas_written,
         }
 
 
 # ---------------------------------------------------------------------------
 # Utilities
 # ---------------------------------------------------------------------------
-def run_cmd(cmd, timeout=20, shell=False):
+def run_cmd(cmd, timeout=30, shell=False):
     """Run a shell command and return (returncode, stdout, stderr)."""
     try:
         result = subprocess.run(
@@ -237,11 +269,11 @@ def format_age(days):
 
     parts = []
     if years > 0:
-        parts.append(f"{years} tahun")
+        parts.append(f"{years} thn")
     if months > 0:
         parts.append(f"{months} bln")
     if days_left > 0 or not parts:
-        parts.append(f"{days_left} hari")
+        parts.append(f"{days_left} hr")
 
     return " ".join(parts)
 
@@ -342,6 +374,37 @@ def get_disk_usage(disk):
 
 
 # ---------------------------------------------------------------------------
+# Windows PowerShell reliability counter (fallback tanpa smartctl)
+# ---------------------------------------------------------------------------
+def get_windows_reliability_counter(device_num):
+    """Coba ambil reliability counter via PowerShell Get-StorageReliabilityCounter."""
+    info = {}
+    ps = (
+        f"Get-StorageReliabilityCounter -DiskNumber {device_num} | "
+        f"Select-Object BytesRead,BytesWritten,Temperature,PowerOnHours,"
+        f"ReallocatedSectors,ReadErrors,WriteErrors | ConvertTo-Json -Depth 2"
+    )
+    rc, out, _ = run_cmd(["powershell", "-Command", ps], shell=True)
+    if rc != 0 or not out.strip():
+        return info
+    try:
+        data = json.loads(out)
+        if isinstance(data, list):
+            data = data[0] if data else {}
+        if isinstance(data, dict):
+            info["bytes_read"] = parse_size(data.get("BytesRead", 0))
+            info["bytes_written"] = parse_size(data.get("BytesWritten", 0))
+            info["temperature"] = parse_size(data.get("Temperature", 0))
+            info["power_on_hours"] = parse_size(data.get("PowerOnHours", 0))
+            info["reallocated_sectors"] = parse_size(data.get("ReallocatedSectors", 0))
+            info["read_errors"] = parse_size(data.get("ReadErrors", 0))
+            info["write_errors"] = parse_size(data.get("WriteErrors", 0))
+    except (json.JSONDecodeError, IndexError):
+        pass
+    return info
+
+
+# ---------------------------------------------------------------------------
 # Disk discovery
 # ---------------------------------------------------------------------------
 def discover_windows_disks():
@@ -375,23 +438,24 @@ def discover_windows_disks():
         size = parse_size(item.get("Size", 0))
         mediatype = item.get("MediaType", "") or ""
         iface = item.get("BusType", "") or ""
+        is_nvme = "NVMe" in str(iface).upper()
         health = item.get("HealthStatus", "") or "Unknown"
         op_status = item.get("OperationalStatus", [])
         if isinstance(op_status, list):
             status = ", ".join(str(s) for s in op_status) or health
         else:
             status = str(op_status) if op_status else health
-        disks.append(
-            DiskInfo(
-                device=device,
-                model=model,
-                serial=serial,
-                size=size,
-                interface=iface,
-                type_=mediatype,
-                status=status or "Unknown",
-            )
+        d = DiskInfo(
+            device=device,
+            model=model,
+            serial=serial,
+            size=size,
+            interface=iface,
+            type_=mediatype,
+            status=status or "Unknown",
         )
+        d.is_nvme = is_nvme
+        disks.append(d)
     return disks
 
 
@@ -406,7 +470,6 @@ def discover_linux_disks():
         path = os.path.join(sys_block, entry)
         if not os.path.isdir(path):
             continue
-        # Skip virtual/loop devices
         if entry.startswith(("loop", "ram", "fd")):
             continue
 
@@ -457,21 +520,130 @@ def discover_disks():
 
 
 # ---------------------------------------------------------------------------
-# SMART gathering
+# SMART parsing
 # ---------------------------------------------------------------------------
-def get_smart_smartctl(device):
-    """Ambil data SMART via smartctl (cross-platform)."""
-    info = {"smart_available": False, "attrs": {}}
-    target = device
-    if platform.system() == "Windows" and not target.startswith("\\\\.\\"):
-        target = "\\\\.\\" + target
+def _raw_int(attr):
+    raw = str(attr.get("raw", ""))
+    try:
+        return int(raw.split()[0])
+    except (ValueError, IndexError):
+        try:
+            return int(raw)
+        except ValueError:
+            return 0
 
-    rc, out, _ = run_cmd(["smartctl", "-a", target], timeout=20)
-    # smartctl exit 2 = SMART info tersedia tapi ada error kecil, tetap bisa di-parse
-    if rc not in (0, 2) and not out:
-        return info
 
-    info["smart_available"] = True
+def _parse_int_from_text(text):
+    """Ambil integer pertama dari teks."""
+    if not text:
+        return None
+    m = re.search(r"(\d[\d,]*)", text.replace(",", ""))
+    if m:
+        try:
+            return int(m.group(1).replace(",", ""))
+        except ValueError:
+            return None
+    return None
+
+
+def parse_nvme_smart(out):
+    """Parsing output smartctl -a untuk drive NVMe (NVMe Log 0x02)."""
+    info = {
+        "smart_available": True,
+        "attrs": {},
+        "is_nvme": True,
+        "nvme": {},
+        "model": None,
+        "serial": None,
+        "smart_status": None,
+    }
+
+    for line in out.splitlines():
+        line = line.strip()
+        if "Device Model:" in line or "Model Number:" in line:
+            info["model"] = line.split(":", 1)[1].strip()
+        elif "Serial Number:" in line:
+            info["serial"] = line.split(":", 1)[1].strip()
+        elif "SMART overall-health self-assessment test result:" in line:
+            info["smart_status"] = line.split(":", 1)[1].strip()
+
+    # Parse NVMe specific fields
+    nvme_fields = {
+        "Critical Warning": "critical_warning",
+        "Temperature": "temperature",
+        "Available Spare": "available_spare",
+        "Available Spare Threshold": "available_spare_thresh",
+        "Percentage Used": "percentage_used",
+        "Data Units Read": "data_units_read",
+        "Data Units Written": "data_units_written",
+        "Host Read Commands": "host_read_commands",
+        "Host Write Commands": "host_write_commands",
+        "Controller Busy Time": "controller_busy_time",
+        "Power Cycles": "power_cycles",
+        "Power On Hours": "power_on_hours",
+        "Unsafe Shutdowns": "unsafe_shutdowns",
+        "Media and Data Integrity Errors": "media_errors",
+        "Error Information Log Entries": "error_log_entries",
+    }
+
+    for line in out.splitlines():
+        for label, key in nvme_fields.items():
+            if label in line:
+                val = line.split(":", 1)[1].strip() if ":" in line else ""
+                info["nvme"][key] = val
+                break
+
+    # Convert numeric values
+    def to_int(val):
+        if val is None:
+            return None
+        m = re.search(r"(\d[\d,]*)", str(val).replace(",", ""))
+        if m:
+            try:
+                return int(m.group(1).replace(",", ""))
+            except ValueError:
+                return None
+        return None
+
+    pohr = to_int(info["nvme"].get("power_on_hours"))
+    if pohr is not None:
+        info["nvme"]["power_on_hours_int"] = pohr
+
+    temp = to_int(info["nvme"].get("temperature"))
+    if temp is not None:
+        info["nvme"]["temperature_int"] = temp
+
+    pct_used = to_int(info["nvme"].get("percentage_used"))
+    if pct_used is not None:
+        info["nvme"]["percentage_used_int"] = pct_used
+
+    spare = to_int(info["nvme"].get("available_spare"))
+    if spare is not None:
+        info["nvme"]["available_spare_int"] = spare
+
+    dur = to_int(info["nvme"].get("data_units_read"))
+    if dur is not None:
+        info["nvme"]["data_units_read_int"] = dur
+
+    duw = to_int(info["nvme"].get("data_units_written"))
+    if duw is not None:
+        info["nvme"]["data_units_written_int"] = duw
+
+    return info
+
+
+def parse_ata_smart(out):
+    """Parsing output smartctl -a untuk drive ATA/SATA (tabel atribut tradisional)."""
+    info = {
+        "smart_available": True,
+        "attrs": {},
+        "is_nvme": False,
+        "nvme": {},
+        "model": None,
+        "serial": None,
+        "smart_status": None,
+    }
+
     for line in out.splitlines():
         if "Device Model:" in line:
             info["model"] = line.split(":", 1)[1].strip()
@@ -479,8 +651,6 @@ def get_smart_smartctl(device):
             info["serial"] = line.split(":", 1)[1].strip()
         elif "SMART overall-health self-assessment test result:" in line:
             info["smart_status"] = line.split(":", 1)[1].strip()
-        elif "LU WWN Device Id:" in line:
-            info["wwn"] = line.split(":", 1)[1].strip()
 
     in_attrs = False
     for line in out.splitlines():
@@ -491,7 +661,7 @@ def get_smart_smartctl(device):
             parts = line.split(None, 10)
             if len(parts) >= 10 and parts[0].isdigit():
                 attr_id = int(parts[0])
-                info.setdefault("attrs", {})[attr_id] = {
+                info["attrs"][attr_id] = {
                     "name": parts[1],
                     "flag": parts[2],
                     "value": parts[3],
@@ -505,6 +675,26 @@ def get_smart_smartctl(device):
     return info
 
 
+def get_smart_smartctl(device):
+    """Ambil data SMART via smartctl (ATA + NVMe)."""
+    info = {"smart_available": False, "attrs": {}, "is_nvme": False, "nvme": {}}
+    target = device
+    if platform.system() == "Windows" and not target.startswith("\\\\.\\"):
+        target = "\\\\.\\" + target
+
+    rc, out, _ = run_cmd(["smartctl", "-a", target], timeout=30)
+    if rc not in (0, 2) and not out:
+        return info
+
+    # Deteksi NVMe vs ATA berdasarkan output
+    if "NVMe SMART/Health Information" in out or "NVMe Log 0x02" in out:
+        info = parse_nvme_smart(out)
+    else:
+        info = parse_ata_smart(out)
+
+    return info
+
+
 def get_smart_windows_powershell(device):
     """Fallback Windows via PowerShell Get-PhysicalDisk jika smartctl tidak ada."""
     ps = (
@@ -513,7 +703,7 @@ def get_smart_windows_powershell(device):
         "OperationalStatus,Size,MediaType | ConvertTo-Json -Depth 3"
     ) % device
     rc, out, _ = run_cmd(["powershell", "-Command", ps], shell=True)
-    info = {"smart_available": False, "attrs": {}}
+    info = {"smart_available": False, "attrs": {}, "is_nvme": False, "nvme": {}}
     if rc == 0 and out.strip():
         try:
             data = json.loads(out)
@@ -535,27 +725,29 @@ def get_smart(disk):
     if system == "Windows":
         if smartctl_available():
             return get_smart_smartctl(disk.device)
-        return get_smart_windows_powershell(disk.device)
+        # Fallback: coba reliability counter + PhysicalDisk basic
+        basic = get_smart_windows_powershell(disk.device)
+        num = "".join(filter(str.isdigit, disk.device))
+        reliability = {}
+        if num:
+            reliability = get_windows_reliability_counter(int(num))
+        # Merge reliability into basic as pseudo-attrs
+        basic["reliability"] = reliability
+        return basic
     if system == "Linux" and smartctl_available():
         return get_smart_smartctl(f"/dev/{disk.device}")
-    return {"smart_available": False, "attrs": {}}
+    return {"smart_available": False, "attrs": {}, "is_nvme": False, "nvme": {}}
 
 
 # ---------------------------------------------------------------------------
-# SMART attribute parsing
+# SMART attribute parsing helpers
 # ---------------------------------------------------------------------------
-def _raw_int(attr):
-    raw = str(attr.get("raw", ""))
-    try:
-        return int(raw.split()[0])
-    except (ValueError, IndexError):
-        try:
-            return int(raw)
-        except ValueError:
-            return 0
-
-
 def get_temperature(smart):
+    # NVMe
+    nvme = smart.get("nvme", {})
+    if nvme.get("temperature_int") is not None:
+        return nvme["temperature_int"]
+    # ATA
     attrs = smart.get("attrs", {})
     for aid in (194, 190):  # Temperature / Airflow Temperature
         if aid in attrs:
@@ -564,9 +756,18 @@ def get_temperature(smart):
 
 
 def get_power_on_hours(smart):
+    # NVMe
+    nvme = smart.get("nvme", {})
+    if nvme.get("power_on_hours_int") is not None:
+        return nvme["power_on_hours_int"]
+    # ATA
     attrs = smart.get("attrs", {})
     if 9 in attrs:  # Power-On Hours
         return _raw_int(attrs[9])
+    # Windows reliability fallback
+    rel = smart.get("reliability", {})
+    if rel.get("power_on_hours") is not None:
+        return rel["power_on_hours"]
     return 0
 
 
@@ -604,6 +805,18 @@ def compute_health(disk, smart):
                 health = min(health, 25)
                 reasons.append(f"{label}: {raw}")
 
+    # NVMe critical warning
+    nvme = smart.get("nvme", {})
+    cw = nvme.get("critical_warning")
+    if cw is not None:
+        try:
+            cw_int = int(str(cw), 16) if str(cw).startswith("0x") else int(cw)
+        except ValueError:
+            cw_int = None
+        if cw_int and cw_int != 0:
+            health = min(health, 15)
+            reasons.append(f"NVMe Critical Warning: {cw}")
+
     # Suhu
     temp = get_temperature(smart)
     if temp is not None:
@@ -614,8 +827,20 @@ def compute_health(disk, smart):
         elif temp >= 50:
             health = min(health, 75)
 
-    # Wear SSD
-    for aid in (231, 233):  # SSD Life Left / Media Wearout Indicator
+    # Wear SSD/NVMe
+    # NVMe Percentage Used
+    pct_used = nvme.get("percentage_used_int")
+    if pct_used is not None:
+        disk.nvme_percentage_used = pct_used
+        if pct_used >= 80:
+            health = min(health, 30)
+            reasons.append(f"NVMe wear terpakai: {pct_used}%")
+        elif pct_used >= 50:
+            health = min(health, 60)
+            reasons.append(f"NVMe wear terpakai: {pct_used}%")
+
+    # ATA SSD wear (231 SSD Life Left, 233 Media Wearout Indicator)
+    for aid in (231, 233):
         if aid in attrs:
             try:
                 val = int(attrs[aid].get("value", 100))
@@ -624,6 +849,12 @@ def compute_health(disk, smart):
             if val < 20:
                 health = min(health, 35)
                 reasons.append(f"Usia SSD menipis (attr {aid})")
+
+    # Windows reliability fallback - reallocated sectors
+    rel = smart.get("reliability", {})
+    if rel.get("reallocated_sectors", 0) > 0:
+        health = min(health, 25)
+        reasons.append(f"Reallocated sectors (PS): {rel['reallocated_sectors']}")
 
     return max(0, health), reasons
 
@@ -636,14 +867,47 @@ def enrich_disk(disk):
     disk.smart_available = smart.get("smart_available", False)
     disk.smart_attrs = smart.get("attrs", {})
     disk.smart_status = smart.get("smart_status", "Unknown")
+    disk.is_nvme = smart.get("is_nvme", False)
+
+    # NVMe fields
+    nvme = smart.get("nvme", {})
+    disk.nvme_critical_warning = nvme.get("critical_warning")
+    disk.nvme_available_spare = nvme.get("available_spare_int")
+    disk.nvme_available_spare_thresh = nvme.get("available_spare_thresh")
+    disk.nvme_percentage_used = nvme.get("percentage_used_int")
+    disk.nvme_data_units_read = nvme.get("data_units_read_int")
+    disk.nvme_data_units_written = nvme.get("data_units_written_int")
+    disk.nvme_host_read_commands = nvme.get("host_read_commands")
+    disk.nvme_host_write_commands = nvme.get("host_write_commands")
+    disk.nvme_power_cycles = nvme.get("power_cycles")
+    disk.nvme_unsafe_shutdowns = nvme.get("unsafe_shutdowns")
+    disk.nvme_media_errors = nvme.get("media_errors")
+
+    # ATA fields
+    attrs = smart.get("attrs", {})
+    if 241 in attrs:
+        disk.ata_total_lbas_written = _raw_int(attrs[241])
+    if 242 in attrs:
+        disk.ata_total_lbas_read = _raw_int(attrs[242])
+
     if smart.get("model"):
         disk.model = smart["model"] or disk.model
     if smart.get("serial"):
         disk.serial = smart["serial"] or disk.serial
     if smart.get("size") and not disk.size:
         disk.size = smart["size"]
+
     disk.temperature = get_temperature(smart)
     disk.power_on_hours = get_power_on_hours(smart)
+
+    # Windows reliability fallback for temperature/power_on_hours
+    rel = smart.get("reliability", {})
+    disk.reliability = rel
+    if disk.temperature is None and rel.get("temperature") is not None:
+        disk.temperature = rel["temperature"]
+    if disk.power_on_hours == 0 and rel.get("power_on_hours") is not None:
+        disk.power_on_hours = rel["power_on_hours"]
+
     disk.health, _ = compute_health(disk, smart)
 
     # Disk usage (used / free)
@@ -653,10 +917,32 @@ def enrich_disk(disk):
     if free is not None:
         disk.free_bytes = free
 
-    # Umur disk berdasarkan Power-On Hours (jam / 24 = hari)
+    # Umur disk berdasarkan Power-On Hours
     if disk.power_on_hours > 0:
         disk.age_days = int(disk.power_on_hours / 24)
+
     return disk
+
+
+# ---------------------------------------------------------------------------
+# Display helpers
+# ---------------------------------------------------------------------------
+def _human_wear(val):
+    if val is None:
+        return "N/A"
+    return f"{val}%"
+
+
+def _human_data_units(val):
+    if val is None:
+        return "N/A"
+    # smartctl usually reports in 512-byte units for NVMe, or GB for some versions
+    # Show raw + approximate GB
+    try:
+        gb = val * 512 / (1024 ** 3)
+        return f"{val:,} (~{gb:.2f} GB)"
+    except (TypeError, ValueError):
+        return f"{val:,}"
 
 
 # ---------------------------------------------------------------------------
@@ -701,18 +987,17 @@ def cmd_list(args):
         print(c("Tidak ada disk fisik terdeteksi.", YELLOW))
         return 0
 
-    # Enrich semua disk agar used/free tersedia
     for d in disks:
         enrich_disk(d)
 
     print(
-        f"\n{BOLD}{'DEVICE':<14}{'MODEL':<24}{'TYPE':<7}{'SIZE':<10}"
+        f"\n{BOLD}{'DEVICE':<14}{'MODEL':<22}{'TYPE':<6}{'SIZE':<10}"
         f"{'USED':<10}{'FREE':<10}{'TEMP':<7}{'HEALTH':<9}{'AGE':<10} STATUS{RESET}"
     )
     print("-" * 112)
     for d in disks:
         dev = d.device
-        model = (d.model[:22] + "..") if len(d.model) > 22 else d.model
+        model = (d.model[:20] + "..") if len(d.model) > 20 else d.model
         dtype = d.type or "N/A"
         size = format_size(d.size)
         used = format_size(d.used_bytes) if d.used_bytes else "N/A"
@@ -722,7 +1007,7 @@ def cmd_list(args):
         age = format_age(d.age_days)
         status = d.status
         print(
-            f"{dev:<14}{model:<24}{dtype:<7}{size:<10}"
+            f"{dev:<14}{model:<22}{dtype:<6}{size:<10}"
             f"{used:<10}{free:<10}{temp:<7}  {health}  {age:<10}  {status}"
         )
     print()
@@ -751,6 +1036,7 @@ def cmd_info(args):
     print(f"Tipe             : {disk.type or 'N/A'}")
     print(f"Antarmuka        : {disk.interface or 'N/A'}")
     print(f"Kapasitas        : {format_size(disk.size)}")
+    print(f"Jenis drive      : {'NVMe' if disk.is_nvme else 'ATA/SATA'}")
     if disk.used_bytes or disk.free_bytes:
         pct = (disk.used_bytes / disk.size * 100) if disk.size else 0
         print(f"Terpakai         : {format_size(disk.used_bytes)} ({pct:.1f}%)")
@@ -763,6 +1049,25 @@ def cmd_info(args):
     print(f"Umur disk        : {format_age(disk.age_days)}")
     print(f"Kesehatan        : {format_health(disk.health)}")
     print()
+
+    # Wear info (SSD/NVMe)
+    if disk.is_nvme:
+        print(f"{BOLD}Info NVMe:{RESET}")
+        print(f"  Wear terpakai   : {_human_wear(disk.nvme_percentage_used)}")
+        print(f"  Available Spare : {disk.nvme_available_spare}% (thresh {disk.nvme_available_spare_thresh}%)")
+        print(f"  Data Units Read : {_human_data_units(disk.nvme_data_units_read)}")
+        print(f"  Data Units Writ.: {_human_data_units(disk.nvme_data_units_written)}")
+        print(f"  Power Cycles    : {disk.nvme_power_cycles if disk.nvme_power_cycles is not None else 'N/A'}")
+        print(f"  Unsafe Shutdowns: {disk.nvme_unsafe_shutdowns if disk.nvme_unsafe_shutdowns is not None else 'N/A'}")
+        print(f"  Media Errors    : {disk.nvme_media_errors if disk.nvme_media_errors is not None else 'N/A'}")
+        if disk.nvme_critical_warning is not None:
+            print(f"  Critical Warning: {disk.nvme_critical_warning}")
+        print()
+    else:
+        print(f"{BOLD}Info ATA/SATA:{RESET}")
+        print(f"  Total LBAs Read : {disk.ata_total_lbas_read if disk.ata_total_lbas_read is not None else 'N/A'}")
+        print(f"  Total LBAs Writ.: {disk.ata_total_lbas_written if disk.ata_total_lbas_written is not None else 'N/A'}")
+        print()
 
     # Show key SMART attributes
     attrs = disk.smart_attrs
@@ -801,25 +1106,65 @@ def cmd_smart(args):
         return 1
 
     enrich_disk(disk)
-    attrs = disk.smart_attrs
-    if not attrs:
-        print(c("Tidak ada data atribut SMART untuk disk ini.", YELLOW))
-        return 0
 
-    print(f"\n{BOLD}SMART ATTRIBUTES - {disk.device}{RESET}")
-    print(
-        f"{'ID':<5}{'NAMA':<30}{'FLAG':<8}{'VALUE':<9}{'WORST':<9}"
-        f"{'THRESH':<9}{'TYPE':<10}{'UPDATED':<10}{'WHEN_FAILED':<14}{'RAW'}"
-    )
-    print("-" * 120)
-    for aid in sorted(attrs.keys()):
-        a = attrs[aid]
+    print(f"\n{BOLD}SMART / HEALTH - {disk.device}{RESET}")
+    print(f"Jenis drive      : {'NVMe' if disk.is_nvme else 'ATA/SATA'}")
+    print(f"SMART tersedia   : {'Ya' if disk.smart_available else 'Tidak'}")
+    print(f"SMART status     : {disk.smart_status}")
+    print(f"Suhu             : {format_temp(disk.temperature)}")
+    print(f"Jam menyala      : {disk.power_on_hours} jam")
+    print(f"Umur disk        : {format_age(disk.age_days)}")
+    print(f"Kesehatan        : {format_health(disk.health)}")
+    print()
+
+    if disk.is_nvme:
+        print(f"{BOLD}NVMe SMART/Health Information (Log 0x02):{RESET}")
+        nvme_fields = [
+            ("Critical Warning", disk.nvme_critical_warning),
+            ("Temperature", f"{disk.temperature}°C" if disk.temperature is not None else "N/A"),
+            ("Available Spare", f"{disk.nvme_available_spare}%" if disk.nvme_available_spare is not None else "N/A"),
+            ("Available Spare Thresh", f"{disk.nvme_available_spare_thresh}%" if disk.nvme_available_spare_thresh is not None else "N/A"),
+            ("Percentage Used (Wear)", f"{disk.nvme_percentage_used}%" if disk.nvme_percentage_used is not None else "N/A"),
+            ("Data Units Read", _human_data_units(disk.nvme_data_units_read)),
+            ("Data Units Written", _human_data_units(disk.nvme_data_units_written)),
+            ("Host Read Commands", disk.nvme_host_read_commands if disk.nvme_host_read_commands is not None else "N/A"),
+            ("Host Write Commands", disk.nvme_host_write_commands if disk.nvme_host_write_commands is not None else "N/A"),
+            ("Power Cycles", disk.nvme_power_cycles if disk.nvme_power_cycles is not None else "N/A"),
+            ("Unsafe Shutdowns", disk.nvme_unsafe_shutdowns if disk.nvme_unsafe_shutdowns is not None else "N/A"),
+            ("Media Errors", disk.nvme_media_errors if disk.nvme_media_errors is not None else "N/A"),
+        ]
+        max_label = max(len(k) for k, _ in nvme_fields)
+        for label, val in nvme_fields:
+            print(f"  {label:<{max_label}} : {val}")
+    else:
+        print(f"{BOLD}ATA SMART Attributes:{RESET}")
         print(
-            f"{aid:<5}{a.get('name',''):<30}{a.get('flag',''):<8}"
-            f"{a.get('value',''):<9}{a.get('worst',''):<9}"
-            f"{a.get('thresh',''):<9}{a.get('type',''):<10}"
-            f"{a.get('updated',''):<10}{a.get('when_failed',''):<14}{a.get('raw','')}"
+            f"{'ID':<5}{'NAMA':<28}{'FLAG':<8}{'VALUE':<9}{'WORST':<9}"
+            f"{'THRESH':<9}{'TYPE':<10}{'UPDATED':<10}{'WHEN_FAILED':<14}{'RAW'}"
         )
+        print("-" * 120)
+        attrs = disk.smart_attrs
+        for aid in sorted(attrs.keys()):
+            a = attrs[aid]
+            print(
+                f"{aid:<5}{a.get('name',''):<28}{a.get('flag',''):<8}"
+                f"{a.get('value',''):<9}{a.get('worst',''):<9}"
+                f"{a.get('thresh',''):<9}{a.get('type',''):<10}"
+                f"{a.get('updated',''):<10}{a.get('when_failed',''):<14}{a.get('raw','')}"
+            )
+
+    # Windows reliability fallback info
+    rel = disk.reliability
+    if rel and any(rel.values()):
+        print()
+        print(f"{BOLD}Windows Reliability Counter (fallback):{RESET}")
+        print(f"  Bytes Read       : {format_size(rel.get('bytes_read', 0))}")
+        print(f"  Bytes Written    : {format_size(rel.get('bytes_written', 0))}")
+        print(f"  Temperature      : {rel.get('temperature', 'N/A')}°C")
+        print(f"  Power On Hours   : {rel.get('power_on_hours', 'N/A')} jam")
+        print(f"  Reallocated Sectors: {rel.get('reallocated_sectors', 'N/A')}")
+        print(f"  Read Errors      : {rel.get('read_errors', 'N/A')}")
+        print(f"  Write Errors     : {rel.get('write_errors', 'N/A')}")
     print()
     return 0
 
@@ -832,20 +1177,20 @@ def cmd_health(args):
         return 0
 
     print(f"\n{BOLD}RINGKASAN KESEHATAN DISK{RESET}")
-    print(f"{'DEVICE':<14}{'MODEL':<24}{'HEALTH':<9}{'TEMP':<7}{'AGE':<10} STATUS")
+    print(f"{'DEVICE':<14}{'MODEL':<22}{'HEALTH':<9}{'TEMP':<7}{'AGE':<10} STATUS")
     print("-" * 75)
     any_bad = False
     for d in disks:
         enrich_disk(d)
         dev = d.device
-        model = (d.model[:22] + "..") if len(d.model) > 22 else d.model
+        model = (d.model[:20] + "..") if len(d.model) > 20 else d.model
         health = d.health
         temp = format_temp(d.temperature)
         age = format_age(d.age_days)
         status = d.status
         col = health_color(health)
         print(
-            f"{dev:<14}{model:<24}{c(f'{health}%', col):<9} {temp:<7}{age:<10} {status}"
+            f"{dev:<14}{model:<22}{c(f'{health}%', col):<9} {temp:<7}{age:<10} {status}"
         )
         if health < 70:
             any_bad = True

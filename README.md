@@ -170,12 +170,64 @@ pip install -r requirements.txt
 
 ---
 
-## ⚠️ Catatan Penting
+## ⚠️ CATATAN PENTING: Install smartctl (smartmontools) untuk Data Lengkap
 
-### Untuk Windows
-Program menggunakan **PowerShell `Get-PhysicalDisk`** bawaan Windows. Jika `smartctl` (dari smartmontools) terinstal, program akan otomatis menggunakannya untuk data SMART yang lebih detail (suhu, bad sector, dll.).
+### Mengapa data umur, wear, dan read/write tidak terbaca?
 
-Tanpa `smartctl`, health score dibatasi maksimal 80% karena data atribut SMART detail tidak tersedia.
+Di Windows, PowerShell bawaan (`Get-PhysicalDisk`) **tidak menyediakan atribut SMART detail** seperti:
+- Umur disk / Power-On Hours
+- Suhu disk
+- Wear leveling SSD / NVMe (percentage used)
+- Total data dibaca dan ditulis (read/write)
+- Bad sector (reallocated sector, pending sector)
+
+Untuk membaca semua informasi di atas, **Anda harus menginstal [smartmontools](https://www.smartmontools.org/)** (perintah `smartctl`).
+
+### Cara Install smartmontools di Windows
+
+1. Unduh installer dari: https://www.smartmontools.org/wiki/Download
+2. Atau via [Chocolatey](https://chocolatey.org/):
+   ```powershell
+   choco install smartmontools
+   ```
+3. Atau via [winget](https://github.com/microsoft/winget-cli):
+   ```powershell
+   winget install smartmontools
+   ```
+4. Pastikan `smartctl` tersedia di PATH (buka CMD/PowerShell baru, ketik `smartctl --version`)
+
+### Setelah smartctl Terinstal
+
+Jalankan ulang script. Program akan otomatis menggunakan `smartctl` dan menampilkan:
+
+```
+DEVICE        MODEL                   TYPE   SIZE      USED      FREE      TEMP   HEALTH   AGE        STATUS
+----------------------------------------------------------------------------------------------------------------
+0             Micron MTFDKCD512QGN..  NVMe   476.94 GB 431.57 GB 45.10 GB  38°C   95%      2 thn 5 hr OK
+```
+
+Dan perintah `info` / `smart` akan menunjukkan:
+- **Umur disk** (dari Power-On Hours)
+- **Wear terpakai** (NVMe Percentage Used)
+- **Data Units Read/Written** (total dibaca/ditulis)
+- **Suhu disk**
+- **Available Spare** (cadangan blok mengganti)
+- **Critical Warning**
+- Dan atribut SMART ATA lainnya (reallocated sector, dll.)
+
+### Tanpa smartctl
+
+Jika tidak menginstal `smartctl`, script tetap berjalan dengan data dasar dari PowerShell:
+- Model, serial, ukuran, tipe, status health dasar
+- Used/free space
+- Health score dibatasi maksimal 80% (indikasi data SMART tidak lengkap)
+- Suhu, umur, wear, read/write akan menampilkan `N/A`
+
+> **Tip:** Beberapa drive NVMe memerlukan `smartctl` dijalankan sebagai **Administrator** untuk mengakses data SMART lengkap.
+
+---
+
+## ⚠️ Catatan Lainnya
 
 ### Data & Privasi
 Semua data (model disk, serial number, suhu, health, used/free) diambil **secara lokal** pada komputer kamu dan **tidak pernah dikirim ke server mana pun**. Output hanya ditampilkan di CLI atau disimpan ke file JSON/CSV lokal.
